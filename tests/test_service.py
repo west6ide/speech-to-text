@@ -367,7 +367,9 @@ def test_service_prefers_cleaner_stereo_channel():
         left_chunk = Path(temp_dir) / "left_chunk_0001.wav"
         right_chunk = Path(temp_dir) / "right_chunk_0001.wav"
         mono_chunk = Path(temp_dir) / "mono_chunk_0001.wav"
-        for path in (left_chunk, right_chunk, mono_chunk):
+        phase_chunk = Path(temp_dir) / "phase_fixed_chunk_0001.wav"
+        reverse_phase_chunk = Path(temp_dir) / "phase_fixed_reverse_chunk_0001.wav"
+        for path in (left_chunk, right_chunk, mono_chunk, phase_chunk, reverse_phase_chunk):
             path.write_bytes(b"chunk")
 
         provider = DummyProvider(
@@ -393,17 +395,33 @@ def test_service_prefers_cleaner_stereo_channel():
                     model="openai/whisper-large-v3-turbo",
                     filename="mono_chunk_0001.wav",
                 ),
+                "phase_fixed_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Сәлеметсіз бе мен қоңырау шалып тұрмын",
+                    raw_text="Сәлеметсіз бе мен қоңырау шалып тұрмын",
+                    corrected_text="Сәлеметсіз бе мен қоңырау шалып тұрмын.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="phase_fixed_chunk_0001.wav",
+                ),
+                "phase_fixed_reverse_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Thank you",
+                    raw_text="Thank you",
+                    corrected_text="Thank you.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="phase_fixed_reverse_chunk_0001.wav",
+                ),
             }
         )
         service = TTSService(settings, provider=provider)
         variants = [
             type("Variant", (), {"name": "left", "chunks": [left_chunk]})(),
             type("Variant", (), {"name": "right", "chunks": [right_chunk]})(),
+            type("Variant", (), {"name": "phase_fixed", "chunks": [phase_chunk]})(),
+            type("Variant", (), {"name": "phase_fixed_reverse", "chunks": [reverse_phase_chunk]})(),
             type("Variant", (), {"name": "mono", "chunks": [mono_chunk]})(),
         ]
         service._preprocessor = DummyPreprocessor(
             DummyPreparedAudio(
-                chunks=[left_chunk, right_chunk, mono_chunk],
+                chunks=[left_chunk, right_chunk, mono_chunk, phase_chunk, reverse_phase_chunk],
                 duration_seconds=12.0,
                 variants=variants,
                 channel_count=2,
@@ -430,7 +448,9 @@ def test_service_merges_distinct_stereo_channels():
         left_chunk = Path(temp_dir) / "left_chunk_0001.wav"
         right_chunk = Path(temp_dir) / "right_chunk_0001.wav"
         mono_chunk = Path(temp_dir) / "mono_chunk_0001.wav"
-        for path in (left_chunk, right_chunk, mono_chunk):
+        phase_chunk = Path(temp_dir) / "phase_fixed_chunk_0001.wav"
+        reverse_phase_chunk = Path(temp_dir) / "phase_fixed_reverse_chunk_0001.wav"
+        for path in (left_chunk, right_chunk, mono_chunk, phase_chunk, reverse_phase_chunk):
             path.write_bytes(b"chunk")
 
         provider = DummyProvider(
@@ -456,17 +476,33 @@ def test_service_merges_distinct_stereo_channels():
                     model="openai/whisper-large-v3-turbo",
                     filename="mono_chunk_0001.wav",
                 ),
+                "phase_fixed_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Thank you",
+                    raw_text="Thank you",
+                    corrected_text="Thank you.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="phase_fixed_chunk_0001.wav",
+                ),
+                "phase_fixed_reverse_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Рақмет",
+                    raw_text="Рақмет",
+                    corrected_text="Рақмет.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="phase_fixed_reverse_chunk_0001.wav",
+                ),
             }
         )
         service = TTSService(settings, provider=provider)
         variants = [
             type("Variant", (), {"name": "left", "chunks": [left_chunk]})(),
             type("Variant", (), {"name": "right", "chunks": [right_chunk]})(),
+            type("Variant", (), {"name": "phase_fixed", "chunks": [phase_chunk]})(),
+            type("Variant", (), {"name": "phase_fixed_reverse", "chunks": [reverse_phase_chunk]})(),
             type("Variant", (), {"name": "mono", "chunks": [mono_chunk]})(),
         ]
         service._preprocessor = DummyPreprocessor(
             DummyPreparedAudio(
-                chunks=[left_chunk, right_chunk, mono_chunk],
+                chunks=[left_chunk, right_chunk, mono_chunk, phase_chunk, reverse_phase_chunk],
                 duration_seconds=12.0,
                 variants=variants,
                 channel_count=2,

@@ -115,6 +115,20 @@ class AudioPreprocessor:
                     )
                 )
 
+            for name, channel_expr in (
+                ("phase_fixed", "pan=mono|c0=c0-c1"),
+                ("phase_fixed_reverse", "pan=mono|c0=c1-c0"),
+            ):
+                normalized_path = workdir / f"{name}.wav"
+                self._normalize_audio(input_path, normalized_path, audio_filter=channel_expr)
+                variants.append(
+                    PreparedAudioVariant(
+                        name=name,
+                        chunks=self._split_audio(normalized_path),
+                        normalized_path=normalized_path,
+                    )
+                )
+
         normalized_path = workdir / "mono.wav"
         self._normalize_audio(input_path, normalized_path, audio_filter="pan=mono|c0=0.5*c0+0.5*c1" if channel_count >= 2 else None)
         variants.append(
