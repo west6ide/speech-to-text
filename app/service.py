@@ -220,12 +220,14 @@ class TTSService:
         report_language: str,
     ) -> AudioTranscriptionResponse:
         semaphore = asyncio.Semaphore(max(1, self._settings.stt_max_parallel_chunks))
+        model_candidates = self._get_stt_model_candidates(model)
 
-        async def transcribe_chunk(index: int, chunk_path, variant_name: str) -> tuple[int, str]:
+        async def transcribe_chunk(index: int, chunk_path, variant_name: str, active_model: str) -> tuple[int, str]:
             async with semaphore:
                 chunk_bytes = chunk_path.read_bytes()
                 self._logger.info(
-                    "service_stt_chunk_started variant=%s index=%s filename=%s chunk_bytes=%s",
+                    "service_stt_chunk_started model=%s variant=%s index=%s filename=%s chunk_bytes=%s",
+                    active_model,
                     variant_name,
                     index,
                     chunk_path.name,
@@ -235,11 +237,12 @@ class TTSService:
                     audio_bytes=chunk_bytes,
                     filename=chunk_path.name,
                     content_type="audio/wav",
-                    model=model,
+                    model=active_model,
                     report_language=report_language,
                 )
                 self._logger.info(
-                    "service_stt_chunk_finished variant=%s index=%s filename=%s transcript_chars=%s",
+                    "service_stt_chunk_finished model=%s variant=%s index=%s filename=%s transcript_chars=%s",
+                    active_model,
                     variant_name,
                     index,
                     chunk_path.name,
@@ -247,19 +250,23 @@ class TTSService:
                 )
                 return index, response.text.strip()
 
-        async def transcribe_variant(variant) -> tuple[str, str]:
+        async def transcribe_variant(variant, active_model: str) -> tuple[tuple[str, str], str]:
             tasks = [
-                asyncio.create_task(transcribe_chunk(index, chunk_path, variant.name))
+                asyncio.create_task(transcribe_chunk(index, chunk_path, variant.name, active_model))
                 for index, chunk_path in enumerate(variant.chunks, start=1)
             ]
             parts = await asyncio.gather(*tasks)
             ordered_text = " ".join(text for _, text in sorted(parts, key=lambda item: item[0]) if text).strip()
-            return variant.name, ordered_text
+            return (active_model, variant.name), ordered_text
 
         variant_results = await asyncio.gather(
-            *(transcribe_variant(variant) for variant in prepared_audio.variants)
+            *(
+                transcribe_variant(variant, active_model)
+                for active_model in model_candidates
+                for variant in prepared_audio.variants
+            )
         )
-        ordered_text = self._select_transcription_text(dict(variant_results))
+        best_model, ordered_text = self._select_transcription_result(dict(variant_results), report_language)
         if not ordered_text:
             raise TTSProviderError("STT pipeline produced empty transcription")
 
@@ -274,7 +281,7 @@ class TTSService:
             text=ordered_text,
             raw_text=ordered_text,
             corrected_text=corrected_text,
-            model=model or self._settings.openai_stt_model,
+            model=best_model,
             filename=filename,
             duration_seconds=prepared_audio.duration_seconds,
             chunk_count=len(prepared_audio.chunks),
@@ -303,31 +310,53 @@ class TTSService:
             normalized = normalized[1:-1].strip()
         return normalized if normalized in {"ru", "kk"} else "ru"
 
-    def _select_transcription_text(self, variant_results: dict[str, str]) -> str:
+    def _get_stt_model_candidates(self, requested_model: str | None) -> list[str]:
+        primary_model = requested_model or self._settings.openai_stt_model
+        candidates = [primary_model]
+        fallback_model = "openai/whisper-large-v3"
+        if primary_model == "openai/whisper-large-v3-turbo":
+            candidates.append(fallback_model)
+        elif requested_model is None and fallback_model not in candidates:
+            candidates.append(fallback_model)
+        return candidates
+
+    def _select_transcription_result(
+        self,
+        variant_results: dict[tuple[str, str], str],
+        report_language: str,
+    ) -> tuple[str, str]:
         scored = {
-            name: (text, self._score_transcription_candidate(text))
-            for name, text in variant_results.items()
+            key: (text, self._score_transcription_candidate(text, report_language))
+            for key, text in variant_results.items()
             if text.strip()
         }
         if not scored:
-            return ""
+            return self._settings.openai_stt_model, ""
 
-        if "left" in scored and "right" in scored:
-            left_text, left_score = scored["left"]
-            right_text, right_score = scored["right"]
-            if (
-                left_score >= 35
-                and right_score >= 35
-                and left_text.casefold() != right_text.casefold()
-                and not self._is_mostly_duplicate(left_text, right_text)
-            ):
-                return f"{left_text}\n{right_text}".strip()
+        for model_name in self._get_stt_model_candidates(None):
+            left_key = (model_name, "left")
+            right_key = (model_name, "right")
+            if left_key in scored and right_key in scored:
+                left_text, left_score = scored[left_key]
+                right_text, right_score = scored[right_key]
+                if (
+                    left_score >= 45
+                    and right_score >= 45
+                    and left_text.casefold() != right_text.casefold()
+                    and not self._is_mostly_duplicate(left_text, right_text)
+                ):
+                    return model_name, f"{left_text}\n{right_text}".strip()
 
-        best_name, (best_text, best_score) = max(scored.items(), key=lambda item: item[1][1])
-        self._logger.info("service_stt_variant_selected variant=%s score=%s", best_name, round(best_score, 2))
-        return best_text
+        (best_model, best_variant), (best_text, best_score) = max(scored.items(), key=lambda item: item[1][1])
+        self._logger.info(
+            "service_stt_variant_selected model=%s variant=%s score=%s",
+            best_model,
+            best_variant,
+            round(best_score, 2),
+        )
+        return best_model, best_text
 
-    def _score_transcription_candidate(self, text: str) -> float:
+    def _score_transcription_candidate(self, text: str, report_language: str) -> float:
         words = re.findall(r"\w+", text, flags=re.UNICODE)
         if not words:
             return 0.0
@@ -339,8 +368,21 @@ class TTSService:
         dominant_script = max(latin_words, cyrillic_words)
         minority_script = min(latin_words, cyrillic_words)
         mixed_script_penalty = 20 if dominant_script >= 3 and minority_script >= 2 else 0
-        length_bonus = min(len(words), 40)
-        return round(unique_ratio * 60 + length_bonus - repeated_sequences * 20 - mixed_script_penalty, 2)
+        length_bonus = min(len(words), 60)
+        short_text_penalty = 20 if len(words) < 3 else 0
+        if report_language == "kk":
+            language_bonus = min(cyrillic_words, len(words)) * 0.8 - latin_words * 1.5
+        else:
+            language_bonus = min(cyrillic_words, len(words)) * 0.4 - latin_words * 0.3
+        return round(
+            unique_ratio * 60
+            + length_bonus
+            + language_bonus
+            - repeated_sequences * 20
+            - mixed_script_penalty
+            - short_text_penalty,
+            2,
+        )
 
     @staticmethod
     def _is_mostly_duplicate(left_text: str, right_text: str) -> bool:

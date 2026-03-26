@@ -118,6 +118,8 @@ class AudioPreprocessor:
             for name, channel_expr in (
                 ("phase_fixed", "pan=mono|c0=c0-c1"),
                 ("phase_fixed_reverse", "pan=mono|c0=c1-c0"),
+                ("phone_cleaned", "pan=mono|c0=c0-c1,highpass=f=120,lowpass=f=3800,afftdn,dynaudnorm"),
+                ("phone_cleaned_reverse", "pan=mono|c0=c1-c0,highpass=f=120,lowpass=f=3800,afftdn,dynaudnorm"),
             ):
                 normalized_path = workdir / f"{name}.wav"
                 self._normalize_audio(input_path, normalized_path, audio_filter=channel_expr)
@@ -136,6 +138,20 @@ class AudioPreprocessor:
                 name="mono",
                 chunks=self._split_audio(normalized_path),
                 normalized_path=normalized_path,
+            )
+        )
+        cleaned_path = workdir / "mono_cleaned.wav"
+        cleaned_filter = (
+            "pan=mono|c0=0.5*c0+0.5*c1,highpass=f=120,lowpass=f=3800,afftdn,dynaudnorm"
+            if channel_count >= 2
+            else "highpass=f=120,lowpass=f=3800,afftdn,dynaudnorm"
+        )
+        self._normalize_audio(input_path, cleaned_path, audio_filter=cleaned_filter)
+        variants.append(
+            PreparedAudioVariant(
+                name="mono_cleaned",
+                chunks=self._split_audio(cleaned_path),
+                normalized_path=cleaned_path,
             )
         )
         return variants
