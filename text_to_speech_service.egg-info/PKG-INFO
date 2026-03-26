@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: text-to-speech-service
+Version: 0.1.0
+Summary: Robust text-to-speech API service
+Requires-Python: >=3.10
+Requires-Dist: fastapi<1.0.0,>=0.115.0
+Requires-Dist: httpx<1.0.0,>=0.27.0
+Requires-Dist: openai<2.0.0,>=1.65.0
+Requires-Dist: pydantic-settings<3.0.0,>=2.8.0
+Requires-Dist: python-multipart<1.0.0,>=0.0.9
+Requires-Dist: uvicorn[standard]<1.0.0,>=0.34.0
+Provides-Extra: dev
+Requires-Dist: pytest<9.0.0,>=8.3.0; extra == "dev"
