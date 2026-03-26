@@ -8,6 +8,7 @@ SUPPORTED_INPUT_AUDIO_TYPES = {
     "audio/mpeg",
     "audio/mp3",
     "audio/wav",
+    "audio/wave",
     "audio/x-wav",
     "audio/ogg",
     "audio/webm",

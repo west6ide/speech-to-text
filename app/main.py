@@ -40,6 +40,15 @@ app = FastAPI(title="Text-to-Speech Service", version="0.1.0", lifespan=lifespan
 logger = logging.getLogger("app.http")
 
 
+def _clean_form_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
 def get_tts_service(settings: Settings = Depends(get_settings)) -> TTSService:
     try:
         return TTSService(settings)
@@ -117,8 +126,8 @@ async def speech_to_text(
         audio_bytes=audio_bytes,
         filename=file.filename or "audio",
         content_type=file.content_type,
-        model=model,
-        report_language=report_language,
+        model=_clean_form_value(model),
+        report_language=_clean_form_value(report_language) or "ru",
     )
 
 
@@ -134,8 +143,8 @@ async def speech_to_text_report(
         audio_bytes=audio_bytes,
         filename=file.filename or "audio",
         content_type=file.content_type,
-        model=model,
-        report_language=report_language,
+        model=_clean_form_value(model),
+        report_language=_clean_form_value(report_language) or "ru",
     )
 
 
@@ -151,6 +160,6 @@ async def meeting_analyze(
         audio_bytes=audio_bytes,
         filename=file.filename or "audio",
         content_type=file.content_type,
-        model=model,
-        report_language=report_language,
+        model=_clean_form_value(model),
+        report_language=_clean_form_value(report_language) or "ru",
     )

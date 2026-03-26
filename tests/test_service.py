@@ -51,9 +51,11 @@ class DummyProvider:
 
 
 class DummyPreparedAudio:
-    def __init__(self, chunks: list[Path], duration_seconds: float):
+    def __init__(self, chunks: list[Path], duration_seconds: float, variants=None, channel_count: int = 1):
         self.chunks = chunks
         self.duration_seconds = duration_seconds
+        self.variants = variants or [type("Variant", (), {"name": "mono", "chunks": chunks})()]
+        self.channel_count = channel_count
         self.cleaned = False
 
     def cleanup(self) -> None:
@@ -357,6 +359,134 @@ def test_service_transcribes_long_audio_in_chunks():
         assert result.chunk_count == 2
         assert result.duration_seconds == 3665.0
         assert prepared_audio.cleaned is True
+
+
+def test_service_prefers_cleaner_stereo_channel():
+    settings = build_settings()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        left_chunk = Path(temp_dir) / "left_chunk_0001.wav"
+        right_chunk = Path(temp_dir) / "right_chunk_0001.wav"
+        mono_chunk = Path(temp_dir) / "mono_chunk_0001.wav"
+        for path in (left_chunk, right_chunk, mono_chunk):
+            path.write_bytes(b"chunk")
+
+        provider = DummyProvider(
+            transcriptions_by_filename={
+                "left_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Сәлеметсіз бе мен қоңырау шалып тұрмын",
+                    raw_text="Сәлеметсіз бе мен қоңырау шалып тұрмын",
+                    corrected_text="Сәлеметсіз бе мен қоңырау шалып тұрмын.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="left_chunk_0001.wav",
+                ),
+                "right_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Қалайсын Қалайсын Қалайсын",
+                    raw_text="Қалайсын Қалайсын Қалайсын",
+                    corrected_text="Қалайсын Қалайсын Қалайсын.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="right_chunk_0001.wav",
+                ),
+                "mono_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Қалайсын Қалайсын Kísi",
+                    raw_text="Қалайсын Қалайсын Kísi",
+                    corrected_text="Қалайсын Қалайсын Kísi.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="mono_chunk_0001.wav",
+                ),
+            }
+        )
+        service = TTSService(settings, provider=provider)
+        variants = [
+            type("Variant", (), {"name": "left", "chunks": [left_chunk]})(),
+            type("Variant", (), {"name": "right", "chunks": [right_chunk]})(),
+            type("Variant", (), {"name": "mono", "chunks": [mono_chunk]})(),
+        ]
+        service._preprocessor = DummyPreprocessor(
+            DummyPreparedAudio(
+                chunks=[left_chunk, right_chunk, mono_chunk],
+                duration_seconds=12.0,
+                variants=variants,
+                channel_count=2,
+            )
+        )
+        service._meeting_analyzer = DummyMeetingAnalyzer(refined_text="Сәлеметсіз бе мен қоңырау шалып тұрмын.", should_refine=True)
+
+        result = asyncio.run(
+            service.transcribe_audio(
+                audio_bytes=b"fake-audio",
+                filename="call.wav",
+                content_type="audio/wave",
+                report_language='"kk"',
+            )
+        )
+
+        assert result.text == "Сәлеметсіз бе мен қоңырау шалып тұрмын"
+        assert result.model == "openai/whisper-large-v3-turbo"
+
+
+def test_service_merges_distinct_stereo_channels():
+    settings = build_settings()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        left_chunk = Path(temp_dir) / "left_chunk_0001.wav"
+        right_chunk = Path(temp_dir) / "right_chunk_0001.wav"
+        mono_chunk = Path(temp_dir) / "mono_chunk_0001.wav"
+        for path in (left_chunk, right_chunk, mono_chunk):
+            path.write_bytes(b"chunk")
+
+        provider = DummyProvider(
+            transcriptions_by_filename={
+                "left_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Сәлеметсіз бе мен клиентпін",
+                    raw_text="Сәлеметсіз бе мен клиентпін",
+                    corrected_text="Сәлеметсіз бе мен клиентпін.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="left_chunk_0001.wav",
+                ),
+                "right_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Сәлеметсіз бе тыңдап тұрмын айта беріңіз",
+                    raw_text="Сәлеметсіз бе тыңдап тұрмын айта беріңіз",
+                    corrected_text="Сәлеметсіз бе тыңдап тұрмын айта беріңіз.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="right_chunk_0001.wav",
+                ),
+                "mono_chunk_0001.wav": AudioTranscriptionResponse(
+                    text="Сәлеметсіз бе",
+                    raw_text="Сәлеметсіз бе",
+                    corrected_text="Сәлеметсіз бе.",
+                    model="openai/whisper-large-v3-turbo",
+                    filename="mono_chunk_0001.wav",
+                ),
+            }
+        )
+        service = TTSService(settings, provider=provider)
+        variants = [
+            type("Variant", (), {"name": "left", "chunks": [left_chunk]})(),
+            type("Variant", (), {"name": "right", "chunks": [right_chunk]})(),
+            type("Variant", (), {"name": "mono", "chunks": [mono_chunk]})(),
+        ]
+        service._preprocessor = DummyPreprocessor(
+            DummyPreparedAudio(
+                chunks=[left_chunk, right_chunk, mono_chunk],
+                duration_seconds=12.0,
+                variants=variants,
+                channel_count=2,
+            )
+        )
+        service._meeting_analyzer = DummyMeetingAnalyzer(
+            refined_text="Сәлеметсіз бе мен клиентпін. Сәлеметсіз бе тыңдап тұрмын айта беріңіз.",
+            should_refine=True,
+        )
+
+        result = asyncio.run(
+            service.transcribe_audio(
+                audio_bytes=b"fake-audio",
+                filename="call.wav",
+                content_type="audio/wav",
+                report_language="kk",
+            )
+        )
+
+        assert result.text == "Сәлеметсіз бе мен клиентпін\nСәлеметсіз бе тыңдап тұрмын айта беріңіз"
 
 
 def test_service_skips_refine_for_suspicious_transcript():

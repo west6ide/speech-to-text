@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import logging
+import re
 import time
 
 from fastapi import HTTPException, status
@@ -90,6 +91,9 @@ class TTSService:
         report_language: str = "ru",
     ) -> AudioTranscriptionResponse:
         started_at = time.perf_counter()
+        report_language = self._sanitize_report_language(report_language)
+        model = self._sanitize_model(model)
+        content_type = self._normalize_content_type(content_type)
         if not audio_bytes:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -217,11 +221,12 @@ class TTSService:
     ) -> AudioTranscriptionResponse:
         semaphore = asyncio.Semaphore(max(1, self._settings.stt_max_parallel_chunks))
 
-        async def transcribe_chunk(index: int, chunk_path) -> tuple[int, str]:
+        async def transcribe_chunk(index: int, chunk_path, variant_name: str) -> tuple[int, str]:
             async with semaphore:
                 chunk_bytes = chunk_path.read_bytes()
                 self._logger.info(
-                    "service_stt_chunk_started index=%s filename=%s chunk_bytes=%s",
+                    "service_stt_chunk_started variant=%s index=%s filename=%s chunk_bytes=%s",
+                    variant_name,
                     index,
                     chunk_path.name,
                     len(chunk_bytes),
@@ -234,19 +239,27 @@ class TTSService:
                     report_language=report_language,
                 )
                 self._logger.info(
-                    "service_stt_chunk_finished index=%s filename=%s transcript_chars=%s",
+                    "service_stt_chunk_finished variant=%s index=%s filename=%s transcript_chars=%s",
+                    variant_name,
                     index,
                     chunk_path.name,
                     len(response.text),
                 )
                 return index, response.text.strip()
 
-        tasks = [
-            asyncio.create_task(transcribe_chunk(index, chunk_path))
-            for index, chunk_path in enumerate(prepared_audio.chunks, start=1)
-        ]
-        parts = await asyncio.gather(*tasks)
-        ordered_text = " ".join(text for _, text in sorted(parts, key=lambda item: item[0]) if text).strip()
+        async def transcribe_variant(variant) -> tuple[str, str]:
+            tasks = [
+                asyncio.create_task(transcribe_chunk(index, chunk_path, variant.name))
+                for index, chunk_path in enumerate(variant.chunks, start=1)
+            ]
+            parts = await asyncio.gather(*tasks)
+            ordered_text = " ".join(text for _, text in sorted(parts, key=lambda item: item[0]) if text).strip()
+            return variant.name, ordered_text
+
+        variant_results = await asyncio.gather(
+            *(transcribe_variant(variant) for variant in prepared_audio.variants)
+        )
+        ordered_text = self._select_transcription_text(dict(variant_results))
         if not ordered_text:
             raise TTSProviderError("STT pipeline produced empty transcription")
 
@@ -266,6 +279,77 @@ class TTSService:
             duration_seconds=prepared_audio.duration_seconds,
             chunk_count=len(prepared_audio.chunks),
         )
+
+    @staticmethod
+    def _normalize_content_type(content_type: str | None) -> str | None:
+        if content_type is None:
+            return None
+        normalized = content_type.strip().lower()
+        return "audio/wav" if normalized == "audio/wave" else normalized
+
+    @staticmethod
+    def _sanitize_model(model: str | None) -> str | None:
+        if model is None:
+            return None
+        normalized = model.strip()
+        if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+            normalized = normalized[1:-1].strip()
+        return normalized or None
+
+    @staticmethod
+    def _sanitize_report_language(report_language: str) -> str:
+        normalized = report_language.strip()
+        if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+            normalized = normalized[1:-1].strip()
+        return normalized if normalized in {"ru", "kk"} else "ru"
+
+    def _select_transcription_text(self, variant_results: dict[str, str]) -> str:
+        scored = {
+            name: (text, self._score_transcription_candidate(text))
+            for name, text in variant_results.items()
+            if text.strip()
+        }
+        if not scored:
+            return ""
+
+        if "left" in scored and "right" in scored:
+            left_text, left_score = scored["left"]
+            right_text, right_score = scored["right"]
+            if (
+                left_score >= 35
+                and right_score >= 35
+                and left_text.casefold() != right_text.casefold()
+                and not self._is_mostly_duplicate(left_text, right_text)
+            ):
+                return f"{left_text}\n{right_text}".strip()
+
+        best_name, (best_text, best_score) = max(scored.items(), key=lambda item: item[1][1])
+        self._logger.info("service_stt_variant_selected variant=%s score=%s", best_name, round(best_score, 2))
+        return best_text
+
+    def _score_transcription_candidate(self, text: str) -> float:
+        words = re.findall(r"\w+", text, flags=re.UNICODE)
+        if not words:
+            return 0.0
+
+        unique_ratio = len({word.casefold() for word in words}) / len(words)
+        repeated_sequences = len(re.findall(r"\b(\w+)( \1\b)+", text, flags=re.IGNORECASE))
+        latin_words = len(re.findall(r"\b[A-Za-z][A-Za-z'-]*\b", text))
+        cyrillic_words = len(re.findall(r"\b[А-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі][А-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі'-]*\b", text))
+        dominant_script = max(latin_words, cyrillic_words)
+        minority_script = min(latin_words, cyrillic_words)
+        mixed_script_penalty = 20 if dominant_script >= 3 and minority_script >= 2 else 0
+        length_bonus = min(len(words), 40)
+        return round(unique_ratio * 60 + length_bonus - repeated_sequences * 20 - mixed_script_penalty, 2)
+
+    @staticmethod
+    def _is_mostly_duplicate(left_text: str, right_text: str) -> bool:
+        left_words = {word.casefold() for word in re.findall(r"\w+", left_text, flags=re.UNICODE)}
+        right_words = {word.casefold() for word in re.findall(r"\w+", right_text, flags=re.UNICODE)}
+        if not left_words or not right_words:
+            return False
+        overlap = len(left_words & right_words) / max(len(left_words), len(right_words))
+        return overlap > 0.8
 
     def _split_text_for_analysis(self, text: str) -> list[str]:
         limit = self._settings.max_text_length
