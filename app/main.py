@@ -10,6 +10,7 @@ from app.config import Settings, get_settings
 from app.errors import TTSConfigurationError
 from app.logging_config import configure_logging
 from app.models import (
+    AdvancedAudioAnalysisResponse,
     AudioAnalysisReportResponse,
     AudioTranscriptionResponse,
     MeetingAnalysisResponse,
@@ -157,6 +158,23 @@ async def meeting_analyze(
 ) -> MeetingAnalysisResponse:
     audio_bytes = await file.read()
     return await service.analyze_meeting_audio(
+        audio_bytes=audio_bytes,
+        filename=file.filename or "audio",
+        content_type=file.content_type,
+        model=_clean_form_value(model),
+        report_language=_clean_form_value(report_language) or "ru",
+    )
+
+
+@app.post("/v2/audio/analyze", response_model=AdvancedAudioAnalysisResponse)
+async def audio_analyze_advanced(
+    file: UploadFile = File(...),
+    model: str | None = Form(default=None),
+    report_language: str = Form(default="ru"),
+    service: TTSService = Depends(get_tts_service),
+) -> AdvancedAudioAnalysisResponse:
+    audio_bytes = await file.read()
+    return await service.analyze_audio_advanced(
         audio_bytes=audio_bytes,
         filename=file.filename or "audio",
         content_type=file.content_type,

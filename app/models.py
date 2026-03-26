@@ -138,3 +138,46 @@ class MeetingAnalysisResponse(BaseModel):
     transcription: AudioTranscriptionResponse
     analysis: TextAnalysisResult
     summary: MeetingSummary
+
+
+class AudioProfile(BaseModel):
+    duration_seconds: float
+    channel_count: int
+    variant_count: int
+    chunk_count: int
+    content_type: str | None = None
+    detected_call_recording: bool
+    recommended_model: str
+
+
+class TranscriptionCandidate(BaseModel):
+    model: str
+    variant: str
+    text: str
+    score: float
+    suspicious: bool
+
+
+class SuspiciousSpan(BaseModel):
+    fragment: str
+    reason: str
+    confidence: float = Field(..., ge=0, le=1)
+    alternatives: list[str] = Field(default_factory=list)
+
+
+class AdvancedTranscriptionResult(BaseModel):
+    text: str
+    corrected_text: str
+    model: str
+    variant: str
+    confidence: float = Field(..., ge=0, le=1)
+    suspicious: bool
+    suspicious_spans: list[SuspiciousSpan] = Field(default_factory=list)
+
+
+class AdvancedAudioAnalysisResponse(BaseModel):
+    audio_profile: AudioProfile
+    transcription: AdvancedTranscriptionResult
+    candidates: list[TranscriptionCandidate] = Field(default_factory=list)
+    analysis: TextAnalysisResult
+    summary: MeetingSummary

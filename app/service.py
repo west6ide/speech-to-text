@@ -12,15 +12,20 @@ from app.config import Settings
 from app.errors import TTSConfigurationError, TTSProviderError
 from app.meeting_analyzer import MeetingAnalyzer
 from app.models import (
+    AdvancedAudioAnalysisResponse,
+    AdvancedTranscriptionResult,
     AudioAnalysisReportResponse,
+    AudioProfile,
     MeetingAnalysisResponse,
     AudioTranscriptionResponse,
+    SuspiciousSpan,
     SUPPORTED_INPUT_AUDIO_TYPES,
     TTSReportResponse,
     TTSRequest,
     TTSResponse,
     TextAnalysisRequest,
     TextAnalysisResult,
+    TranscriptionCandidate,
 )
 from app.providers.base import BaseTTSProvider
 from app.providers.openai_provider import OpenAITTSProvider
@@ -190,6 +195,97 @@ class TTSService:
             summary=summary,
         )
 
+    async def analyze_audio_advanced(
+        self,
+        audio_bytes: bytes,
+        filename: str,
+        content_type: str | None = None,
+        model: str | None = None,
+        report_language: str = "ru",
+    ) -> AdvancedAudioAnalysisResponse:
+        started_at = time.perf_counter()
+        report_language = self._sanitize_report_language(report_language)
+        model = self._sanitize_model(model)
+        content_type = self._normalize_content_type(content_type)
+        if not audio_bytes:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="audio file is empty",
+            )
+        if content_type and content_type not in SUPPORTED_INPUT_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"unsupported audio content type: {content_type}",
+            )
+
+        prepared_audio = None
+        try:
+            prepared_audio = self._preprocessor.prepare(audio_bytes=audio_bytes, filename=filename)
+            best_model, best_variant, best_text, candidate_payloads = await self._run_transcription_candidates(
+                prepared_audio=prepared_audio,
+                model=model,
+                report_language=report_language,
+            )
+            if not best_text:
+                raise TTSProviderError("STT pipeline produced empty transcription")
+
+            corrected_text = self._analyzer.correct_text(best_text)
+            if self._meeting_analyzer.should_refine_transcript(corrected_text):
+                corrected_text = await self._meeting_analyzer.refine_transcript(
+                    corrected_text,
+                    report_language=report_language,
+                )
+
+            suspicious_spans = self._build_suspicious_spans(best_text)
+            suspicious = bool(suspicious_spans) or not self._meeting_analyzer.should_refine_transcript(best_text)
+            confidence = self._confidence_from_score(
+                self._score_transcription_candidate(best_text, report_language)
+            )
+            analysis = await self.analyze_text(
+                TextAnalysisRequest(text=corrected_text, report_language=report_language)
+            )
+            if suspicious:
+                summary = self._meeting_analyzer.fallback_summary(best_text, report_language)
+            else:
+                summary = await self._meeting_analyzer.summarize_meeting(corrected_text, report_language)
+
+            self._logger.info(
+                "service_advanced_audio_finished duration_ms=%s candidates=%s suspicious=%s",
+                round((time.perf_counter() - started_at) * 1000, 2),
+                len(candidate_payloads),
+                suspicious,
+            )
+            return AdvancedAudioAnalysisResponse(
+                audio_profile=AudioProfile(
+                    duration_seconds=prepared_audio.duration_seconds,
+                    channel_count=prepared_audio.channel_count,
+                    variant_count=len(prepared_audio.variants),
+                    chunk_count=len(prepared_audio.chunks),
+                    content_type=content_type,
+                    detected_call_recording=prepared_audio.channel_count >= 2,
+                    recommended_model=best_model,
+                ),
+                transcription=AdvancedTranscriptionResult(
+                    text=best_text,
+                    corrected_text=corrected_text,
+                    model=best_model,
+                    variant=best_variant,
+                    confidence=confidence,
+                    suspicious=suspicious,
+                    suspicious_spans=suspicious_spans,
+                ),
+                candidates=candidate_payloads[:8],
+                analysis=analysis,
+                summary=summary,
+            )
+        except TTSConfigurationError as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+        except TTSProviderError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+        finally:
+            if prepared_audio is not None:
+                prepared_audio.cleanup()
+
     async def _analyze_long_text(self, text: str) -> TextAnalysisResult:
         return await self._analyze_long_text_with_language(text=text, report_language="ru")
 
@@ -219,6 +315,37 @@ class TTSService:
         model: str | None,
         report_language: str,
     ) -> AudioTranscriptionResponse:
+        best_model, _, ordered_text, _ = await self._run_transcription_candidates(
+            prepared_audio=prepared_audio,
+            model=model,
+            report_language=report_language,
+        )
+        if not ordered_text:
+            raise TTSProviderError("STT pipeline produced empty transcription")
+
+        corrected_text = self._analyzer.correct_text(ordered_text)
+        if self._meeting_analyzer.should_refine_transcript(corrected_text):
+            corrected_text = await self._meeting_analyzer.refine_transcript(
+                corrected_text,
+                report_language=report_language,
+            )
+
+        return AudioTranscriptionResponse(
+            text=ordered_text,
+            raw_text=ordered_text,
+            corrected_text=corrected_text,
+            model=best_model,
+            filename=filename,
+            duration_seconds=prepared_audio.duration_seconds,
+            chunk_count=len(prepared_audio.chunks),
+        )
+
+    async def _run_transcription_candidates(
+        self,
+        prepared_audio,
+        model: str | None,
+        report_language: str,
+    ) -> tuple[str, str, str, list[TranscriptionCandidate]]:
         semaphore = asyncio.Semaphore(max(1, self._settings.stt_max_parallel_chunks))
         model_candidates = self._get_stt_model_candidates(model)
 
@@ -266,26 +393,10 @@ class TTSService:
                 for variant in prepared_audio.variants
             )
         )
-        best_model, ordered_text = self._select_transcription_result(dict(variant_results), report_language)
-        if not ordered_text:
-            raise TTSProviderError("STT pipeline produced empty transcription")
-
-        corrected_text = self._analyzer.correct_text(ordered_text)
-        if self._meeting_analyzer.should_refine_transcript(corrected_text):
-            corrected_text = await self._meeting_analyzer.refine_transcript(
-                corrected_text,
-                report_language=report_language,
-            )
-
-        return AudioTranscriptionResponse(
-            text=ordered_text,
-            raw_text=ordered_text,
-            corrected_text=corrected_text,
-            model=best_model,
-            filename=filename,
-            duration_seconds=prepared_audio.duration_seconds,
-            chunk_count=len(prepared_audio.chunks),
-        )
+        variant_map = dict(variant_results)
+        best_model, best_variant, best_text = self._select_transcription_result(variant_map, report_language)
+        candidate_payloads = self._build_candidate_payloads(variant_map, report_language)
+        return best_model, best_variant, best_text, candidate_payloads
 
     @staticmethod
     def _normalize_content_type(content_type: str | None) -> str | None:
@@ -324,14 +435,14 @@ class TTSService:
         self,
         variant_results: dict[tuple[str, str], str],
         report_language: str,
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, str]:
         scored = {
             key: (text, self._score_transcription_candidate(text, report_language))
             for key, text in variant_results.items()
             if text.strip()
         }
         if not scored:
-            return self._settings.openai_stt_model, ""
+            return self._settings.openai_stt_model, "unknown", ""
 
         for model_name in self._get_stt_model_candidates(None):
             left_key = (model_name, "left")
@@ -345,7 +456,7 @@ class TTSService:
                     and left_text.casefold() != right_text.casefold()
                     and not self._is_mostly_duplicate(left_text, right_text)
                 ):
-                    return model_name, f"{left_text}\n{right_text}".strip()
+                    return model_name, "left+right", f"{left_text}\n{right_text}".strip()
 
         (best_model, best_variant), (best_text, best_score) = max(scored.items(), key=lambda item: item[1][1])
         self._logger.info(
@@ -354,7 +465,70 @@ class TTSService:
             best_variant,
             round(best_score, 2),
         )
-        return best_model, best_text
+        return best_model, best_variant, best_text
+
+    def _build_candidate_payloads(
+        self,
+        variant_results: dict[tuple[str, str], str],
+        report_language: str,
+    ) -> list[TranscriptionCandidate]:
+        candidates: list[TranscriptionCandidate] = []
+        for (model_name, variant_name), text in variant_results.items():
+            if not text.strip():
+                continue
+            score = self._score_transcription_candidate(text, report_language)
+            candidates.append(
+                TranscriptionCandidate(
+                    model=model_name,
+                    variant=variant_name,
+                    text=text,
+                    score=score,
+                    suspicious=not self._meeting_analyzer.should_refine_transcript(text),
+                )
+            )
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        return candidates
+
+    def _build_suspicious_spans(self, text: str) -> list[SuspiciousSpan]:
+        spans: list[SuspiciousSpan] = []
+        fragments = [fragment.strip() for fragment in re.split(r"(?<=[.!?])\s+|\n+", text) if fragment.strip()]
+        for fragment in fragments[:8]:
+            if re.search(r"\b(\w+)( \1\b)+", fragment, flags=re.IGNORECASE):
+                spans.append(
+                    SuspiciousSpan(
+                        fragment=fragment,
+                        reason="repeated_words",
+                        confidence=0.25,
+                        alternatives=[],
+                    )
+                )
+                continue
+            latin_words = len(re.findall(r"\b[A-Za-z][A-Za-z'-]*\b", fragment))
+            cyrillic_words = len(re.findall(r"\b[А-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі][А-Яа-яЁёӘәҒғҚқҢңӨөҰұҮүҺһІі'-]*\b", fragment))
+            if latin_words >= 2 and cyrillic_words >= 2:
+                spans.append(
+                    SuspiciousSpan(
+                        fragment=fragment,
+                        reason="mixed_script",
+                        confidence=0.3,
+                        alternatives=[],
+                    )
+                )
+            elif len(fragment.split()) <= 2:
+                spans.append(
+                    SuspiciousSpan(
+                        fragment=fragment,
+                        reason="too_short_for_confident_interpretation",
+                        confidence=0.4,
+                        alternatives=[],
+                    )
+                )
+        return spans
+
+    @staticmethod
+    def _confidence_from_score(score: float) -> float:
+        bounded = max(0.0, min(1.0, (score + 20.0) / 100.0))
+        return round(bounded, 3)
 
     def _score_transcription_candidate(self, text: str, report_language: str) -> float:
         words = re.findall(r"\w+", text, flags=re.UNICODE)
